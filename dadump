@@ -1,0 +1,182 @@
+#! /usr/bin/env python
+"""
+Daily dumps management for Postgresql
+Creates a directory structure:
+
+    destination/yyyy-mm-dd/dbname.dump
+
+After creating a dump deletes the older ones according to retention parameter
+"""
+
+import os
+import sys
+import shutil
+import logging
+import datetime
+import ConfigParser
+import urlparse
+import subprocess
+import time
+import re
+from optparse import OptionParser
+
+APPNAME = 'dadump'
+__version__ = '0.1'
+
+# setup logging
+logger = logging.getLogger(APPNAME)
+logger.setLevel(logging.INFO)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+stdout_formatter = logging.Formatter('%(message)s')
+ch.setFormatter(stdout_formatter)
+logger.addHandler(ch)
+
+# setup conf
+config = ConfigParser.RawConfigParser()
+for loc in os.curdir, os.path.expanduser("~"), "/etc/dadump", os.environ.get("DADUMP_CONF"):
+    try:
+        if loc:
+            with open(os.path.join(loc, "dadump.conf")) as source:
+                config.readfp(source)
+    except IOError:
+        pass
+
+
+def get_destination(section, root=False):
+    today = datetime.datetime.today().strftime('%Y-%m-%d')
+    destination = os.path.expanduser(config.get(section, 'destination'))
+    if root:
+        destination = os.path.join(destination, section)
+    else:
+        destination = os.path.join(destination, section, today)
+    return destination
+
+
+def ensure_destination():
+    """ create destination dir for every config section """
+    for section in config.sections():
+        destination = get_destination(section)
+        if not os.path.exists(destination):
+            logger.info("create dir %s" % destination)
+            os.makedirs(destination)
+
+
+def run_dumps():
+
+    ensure_destination()
+
+    # run pg_dumps
+    procs = []
+    for section in config.sections():
+        urls = config.get(section, 'db').split('\n')
+        urls = [u.strip() for u in urls]
+        urls = [u for u in urls if u]
+
+        for url in urls:
+            db = urlparse.urlparse(url).path.strip('/')
+            destination = os.path.join(get_destination(section), db+'.dmp')
+            command = ['pg_dump', url, '-F', 'custom', '-f', destination]
+            logger.info(' '.join(command))
+            proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc.db = db
+            procs.append(proc)
+
+    # monitor pg_dumps
+    while procs:
+        for i, proc in enumerate(procs):
+            ret = proc.poll()
+            if ret is not None:
+                stdout, stderr = proc.communicate()
+                if ret == 0:
+                    logger.info('Dumping %s is finished' % proc.db)
+                else:
+                    logger.error('Dumping %s has failed' % proc.db)
+                    logger.error(stderr)
+                procs.pop(i)
+        time.sleep(1)
+
+    # remove old dumps
+    for section in config.sections():
+        retention = config.getint(section, 'retention')
+        destination = get_destination(section, True)
+        for d in os.listdir(destination):
+            if re.match('[0-9]{4}-[0-9]{2}-[0-9]{2}', d):
+                dirdate = datetime.datetime.strptime(d, '%Y-%m-%d').date()
+                if dirdate < (datetime.datetime.today().date()-datetime.timedelta(days=retention-1)):
+                    logger.info('deleting old dumps at %s' % os.path.join(destination, d))
+                    shutil.rmtree(os.path.join(destination, d))
+
+
+def list_dumps():
+
+    mwidth = max(len(s) for s in config.sections())
+    for section in config.sections():
+
+        destination = get_destination(section, root=True)
+
+        if os.path.exists(destination):
+            for d in os.listdir(destination):
+                size = sum(os.path.getsize(os.path.join(destination, d, f)) for f in os.listdir(os.path.join(destination, d)))
+                print '%s %s  %s' % (section.ljust(mwidth), d, sizeof_fmt(size))
+
+
+def drop_dump(section, date):
+
+    path = os.path.join(get_destination(section, True), date)
+    shutil.rmtree(path)
+
+
+def sizeof_fmt(num, suffix='B'):
+    for unit in ['', 'K', 'M', 'G', 'T', 'P', 'E', 'Z']:
+        if abs(num) < 1024.0:
+            return "%3.1f%s%s" % (num, unit, suffix)
+        num /= 1024.0
+    return "%.1f%s%s" % (num, 'Yi', suffix)
+
+
+if __name__ == '__main__':
+    usage = """%s v%s
+Daily dumps management for Postgresql
+Usage: %s command argumetns [options]
+
+Commands:
+    list - show all dumps
+    drop - delete a particular dump: drop name yyyy-mm-dd
+    run  - start dumping and cleanup old dumps
+    """ % (APPNAME, __version__, APPNAME)
+
+    parser = OptionParser(usage=usage)
+    parser.add_option('-l', '--log', dest='log_file', default='/var/log/dadump/dadump.log')
+    (options, args) = parser.parse_args()
+
+    if not args:
+        print usage
+        sys.exit(0)
+
+    # add log file
+    try:
+        logfile = '/var/log/dadump/dadump.log'
+        fh = logging.FileHandler(logfile)
+        fh.setLevel(logging.INFO)
+        file_formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
+        fh.setFormatter(file_formatter)
+        logger.addHandler(fh)
+    except IOError:
+        logger.error('Failed to create log file at %s\nCreate directory /var/log/dadump with appropriate privileges' % logfile)
+
+    if args[0] == 'list':
+        list_dumps()
+
+    elif args[0] == 'run':
+        run_dumps()
+
+    elif args[0] == 'drop':
+        if len(args) != 3:
+            print "Wrong number of arguments for command drop\nExpected name and date of dump to drop:\n  drop name yyyy-mm-dd"
+        else:
+            drop_dump(args[1], args[2])
+
+    else:
+        print "Unknown command %s" % args[0]
+        print usage
