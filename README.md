@@ -15,7 +15,7 @@ Removes old dumps according to retention configuration.
 
     python setup.py install
 
-In order to store a log file create a directory */var/log/dadump* with rights your user can right to it
+In order to store a log file create a directory */var/log/dadump* with rights your user can write to it
 
 ## Configuration
 
@@ -26,7 +26,7 @@ Configuration file is placed at */etc/dadump/dadump.conf*
     retention = 2
     destination = ~/dumps
 
-In order to manage more database clusters add separate section:
+In order to manage more database clusters add a separate section:
 
     [mycluster]
     db = postgresql://postgres@localhost:5432/mydb
